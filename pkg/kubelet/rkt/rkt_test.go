@@ -120,3 +120,59 @@ func TestCheckVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestListImages(t *testing.T) {
+	fr := newFakeRktInterface()
+	fs := newFakeSystemd()
+	r := &Runtime{apisvc: fr, systemd: fs}
+
+	tests := []struct {
+		images []*rktapi.Image
+	}{
+		{},
+		{
+			[]*rktapi.Image{
+				&rktapi.Image{
+					Id:      "sha512-a2fb8f390702",
+					Name:    "quay.io/coreos/alpine-sh",
+					Version: "latest",
+				},
+			},
+		},
+		{
+			[]*rktapi.Image{
+				&rktapi.Image{
+					Id:      "sha512-a2fb8f390702",
+					Name:    "quay.io/coreos/alpine-sh",
+					Version: "latest",
+				},
+				&rktapi.Image{
+					Id:      "sha512-c6b597f42816",
+					Name:    "coreos.com/rkt/stage1-coreos",
+					Version: "0.10.0",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		fr.images = tt.images
+
+		//testCaseHint := fmt.Sprintf("test case #%d", i)
+		images, err := r.ListImages()
+		if err != nil {
+			t.Errorf("%v", err)
+		}
+		if len(tt.images) != len(images) {
+			t.Errorf("incorrect number of images returned, expecting=%d, got=%d", len(tt.images), len(images))
+		}
+		for i, image := range images {
+			if tt.images[i].Id != image.ID {
+				t.Errorf("mismatched image IDs, expecting=%s, got=%s", tt.images[i].Id, image.ID)
+			}
+			if len(image.Tags) != 1 || tt.images[i].Name != image.Tags[0] {
+				t.Errorf("mismatched image tags, expecting=%v, got=%v", []string{tt.images[i].Name}, image.Tags)
+			}
+		}
+	}
+}
