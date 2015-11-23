@@ -72,6 +72,14 @@ const (
 	unitRktID             = "RktID"
 	unitRestartCount      = "RestartCount"
 
+	kubernetesInfoAnnoName  = "k8s.io/pod/information"
+	k8sRktUIDAnno           = "k8s.io/rkt/uid"
+	k8sRktNameAnno          = "k8s.io/rkt/name"
+	k8sRktNamespaceAnno     = "k8s.io/rkt/namespace"
+	k8sRktCreationTimeAnno  = "k8s.io/rkt/created"
+	k8sRktContainerHashAnno = "k8s/rkt/containerhash"
+	k8sRktRestartCountAnno  = "k8s/rkt/restartCount"
+
 	dockerPrefix = "docker://"
 
 	authDir            = "auth.d"
@@ -426,6 +434,73 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 	var globalPortMappings []kubecontainer.PortMapping
 	manifest := appcschema.BlankPodManifest()
 
+	listReq := &rktapi.ListPodsRequest{
+		Filter: &rktapi.PodFilter{
+			States: []rktapi.PodState{
+				rktapi.PodState_POD_STATE_RUNNING,
+				rktapi.PodState_POD_STATE_EXITED,
+				rktapi.PodState_POD_STATE_DELETING,
+				rktapi.PodState_POD_STATE_GARBAGE,
+			},
+		},
+	}
+	listResp, err := r.apisvc.ListPods(context.Background(), listReq)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't list pods: %v", err)
+	}
+
+	restartCount := 0
+	for _, rktpod := range listResp.Pods {
+		manifest := appcschema.PodManifest{}
+		err = json.Unmarshal(rktpod.Manifest, manifest)
+		if err != nil {
+			return nil, err
+		}
+		if uid, ok := manifest.Annotations.Get(k8sRktUIDAnno); ok && uid == string(pod.UID) {
+			if countString, ok := manifest.Annotations.Get(k8sRktRestartCountAnno); ok {
+				num, err := strconv.Atoi(countString)
+				if err != nil {
+					continue
+				}
+				if num+1 > restartCount {
+					restartCount = num + 1
+				}
+			}
+		}
+	}
+
+	//containerHashes := ""
+	//for _, c := range pod.Spec.Containers {
+	//	hash := kubecontainer.HashContainer(&c)
+	//	if containerHashes != "" {
+	//		containerHashes += ":"
+	//	}
+	//	containerHashes += strconv.FormatUint(hash, 10)
+	//}
+
+	manifest.Annotations = append(manifest.Annotations, []appctypes.Annotation{
+		appctypes.Annotation{
+			Name:  *appctypes.MustACIdentifier(k8sRktUIDAnno),
+			Value: string(pod.UID),
+		},
+		appctypes.Annotation{
+			Name:  *appctypes.MustACIdentifier(k8sRktNameAnno),
+			Value: pod.Name,
+		},
+		appctypes.Annotation{
+			Name:  *appctypes.MustACIdentifier(k8sRktNamespaceAnno),
+			Value: pod.Namespace,
+		},
+		appctypes.Annotation{
+			Name:  *appctypes.MustACIdentifier(k8sRktCreationTimeAnno),
+			Value: strconv.FormatInt(time.Now().Unix(), 10),
+		},
+		appctypes.Annotation{
+			Name:  *appctypes.MustACIdentifier(k8sRktRestartCountAnno),
+			Value: strconv.Itoa(restartCount),
+		},
+	}...)
+
 	for _, c := range pod.Spec.Containers {
 		if err, _ := r.imagePuller.PullImage(pod, &c, pullSecrets); err != nil {
 			return nil, err
@@ -434,6 +509,9 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 		if err != nil {
 			return nil, err
 		}
+
+		kubehash := kubecontainer.HashContainer(&c)
+		imgManifest.Annotations.Set(*appctypes.MustACIdentifier(k8sRktContainerHashAnno), strconv.FormatUint(kubehash, 10))
 
 		if imgManifest.App == nil {
 			imgManifest.App = new(appctypes.App)
@@ -730,6 +808,98 @@ func (r *Runtime) RunPod(pod *api.Pod, pullSecrets []api.Secret) error {
 	return nil
 }
 
+// convertRktPod will convert a rktapi.Pod to a kubecontainer.Pod
+func (r *Runtime) convertRktPod(rktpod rktapi.Pod) (*kubecontainer.Pod, *rktInfo, error) {
+	manifest := &appcschema.ImageManifest{}
+	err := json.Unmarshal(rktpod.Manifest, manifest)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	podUID, ok := manifest.Annotations.Get(k8sRktUIDAnno)
+	if !ok {
+		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktUIDAnno)
+	}
+	podName, ok := manifest.Annotations.Get(k8sRktNameAnno)
+	if !ok {
+		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktNameAnno)
+	}
+	podNamespace, ok := manifest.Annotations.Get(k8sRktNamespaceAnno)
+	if !ok {
+		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktNamespaceAnno)
+	}
+	podCreatedString, ok := manifest.Annotations.Get(k8sRktCreationTimeAnno)
+	if !ok {
+		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktCreationTimeAnno)
+	}
+	podCreated, err := strconv.ParseInt(podCreatedString, 10, 64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("couldn't parse pod creation timestamp: %v", err)
+	}
+
+	restartCountString, ok := manifest.Annotations.Get(k8sRktRestartCountAnno)
+	if !ok {
+		return nil, nil, fmt.Errorf("pod is missing annotation: %s", k8sRktRestartCountAnno)
+	}
+	restartCount, err := strconv.Atoi(restartCountString)
+	if err != nil {
+		return nil, nil, fmt.Errorf("couldn't parse pod restart count: %v", err)
+	}
+
+	var containerHashes []uint64
+	for _, app := range rktpod.Apps {
+		manifest := appcschema.ImageManifest{}
+		err := json.Unmarshal(app.Image.Manifest, manifest)
+		if err != nil {
+			return nil, nil, err
+		}
+		containerHashString, ok := manifest.Annotations.Get(k8sRktContainerHashAnno)
+		if !ok {
+			return nil, nil, fmt.Errorf("app is missing annotation %s", k8sRktContainerHashAnno)
+		}
+		containerHash, err := strconv.ParseUint(containerHashString, 10, 64)
+		if err != nil {
+			return nil, nil, fmt.Errorf("couldn't parse container's hash: %v", err)
+		}
+		containerHashes = append(containerHashes, containerHash)
+	}
+
+	var status kubecontainer.ContainerStatus
+	switch rktpod.State {
+	case rktapi.PodState_POD_STATE_RUNNING:
+		status = kubecontainer.ContainerStatusRunning
+	case rktapi.PodState_POD_STATE_ABORTED_PREPARE, rktapi.PodState_POD_STATE_EXITED,
+		rktapi.PodState_POD_STATE_DELETING, rktapi.PodState_POD_STATE_GARBAGE:
+		status = kubecontainer.ContainerStatusExited
+	default:
+		status = kubecontainer.ContainerStatusUnknown
+	}
+
+	kubepod := &kubecontainer.Pod{
+		ID:        types.UID(podUID),
+		Name:      podName,
+		Namespace: podNamespace,
+	}
+	for i, app := range rktpod.Apps {
+		kubepod.Containers = append(kubepod.Containers, &kubecontainer.Container{
+			ID:      buildContainerID(&containerID{podUID, app.Name}),
+			Name:    app.Name,
+			Image:   app.Image.Name,
+			Hash:    containerHashes[i],
+			Created: podCreated,
+			Status:  status,
+		})
+	}
+
+	info := &rktInfo{
+		uuid: string(podUID),
+		//TODO: figure out how to get the restartCount
+		restartCount: restartCount,
+	}
+
+	return kubepod, info, nil
+}
+
 // readServiceFile reads the service file and constructs the runtime pod and the rkt info.
 func (r *Runtime) readServiceFile(serviceName string) (*kubecontainer.Pod, *rktInfo, error) {
 	f, err := os.Open(serviceFilePath(serviceName))
@@ -781,34 +951,26 @@ func (r *Runtime) readServiceFile(serviceName string) (*kubecontainer.Pod, *rktI
 func (r *Runtime) GetPods(all bool) ([]*kubecontainer.Pod, error) {
 	glog.V(4).Infof("Rkt getting pods")
 
-	units, err := r.systemd.ListUnits()
+	ctx := context.Background()
+	listReq := &rktapi.ListPodsRequest{}
+	if !all {
+		listReq.Filter = &rktapi.PodFilter{
+			States: []rktapi.PodState{rktapi.PodState_POD_STATE_RUNNING},
+		}
+	}
+	listResp, err := r.apisvc.ListPods(ctx, listReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("couldn't list pods: %v", err)
 	}
 
 	var pods []*kubecontainer.Pod
-	for _, u := range units {
-		if strings.HasPrefix(u.Name, kubernetesUnitPrefix) {
-			var status kubecontainer.ContainerStatus
-			switch {
-			case u.SubState == "running":
-				status = kubecontainer.ContainerStatusRunning
-			default:
-				status = kubecontainer.ContainerStatusExited
-			}
-			if !all && status != kubecontainer.ContainerStatusRunning {
-				continue
-			}
-			pod, _, err := r.readServiceFile(u.Name)
-			if err != nil {
-				glog.Warningf("rkt: Cannot construct pod from unit file: %v.", err)
-				continue
-			}
-			for _, c := range pod.Containers {
-				c.Status = status
-			}
-			pods = append(pods, pod)
+	for _, rktpod := range listResp.Pods {
+		pod, _, err := r.convertRktPod(*rktpod)
+		if err != nil {
+			glog.Warningf("rkt: Cannot construct pod from unit file: %v.", err)
+			continue
 		}
+		pods = append(pods, pod)
 	}
 	return pods, nil
 }
