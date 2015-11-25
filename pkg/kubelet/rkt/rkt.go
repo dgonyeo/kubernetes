@@ -829,41 +829,32 @@ func (r *Runtime) RunPod(pod *api.Pod, pullSecrets []api.Secret) error {
 }
 
 // convertRktPod will convert a rktapi.Pod to a kubecontainer.Pod
-func (r *Runtime) convertRktPod(rktpod rktapi.Pod) (*kubecontainer.Pod, *rktInfo, error) {
+func (r *Runtime) convertRktPod(rktpod rktapi.Pod) (*kubecontainer.Pod, error) {
 	manifest := &appcschema.ImageManifest{}
 	err := json.Unmarshal(rktpod.Manifest, manifest)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	podUID, ok := manifest.Annotations.Get(k8sRktUIDAnno)
 	if !ok {
-		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktUIDAnno)
+		return nil, fmt.Errorf("pod is missing annotation %s", k8sRktUIDAnno)
 	}
 	podName, ok := manifest.Annotations.Get(k8sRktNameAnno)
 	if !ok {
-		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktNameAnno)
+		return nil, fmt.Errorf("pod is missing annotation %s", k8sRktNameAnno)
 	}
 	podNamespace, ok := manifest.Annotations.Get(k8sRktNamespaceAnno)
 	if !ok {
-		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktNamespaceAnno)
+		return nil, fmt.Errorf("pod is missing annotation %s", k8sRktNamespaceAnno)
 	}
 	podCreatedString, ok := manifest.Annotations.Get(k8sRktCreationTimeAnno)
 	if !ok {
-		return nil, nil, fmt.Errorf("pod is missing annotation %s", k8sRktCreationTimeAnno)
+		return nil, fmt.Errorf("pod is missing annotation %s", k8sRktCreationTimeAnno)
 	}
 	podCreated, err := strconv.ParseInt(podCreatedString, 10, 64)
 	if err != nil {
-		return nil, nil, fmt.Errorf("couldn't parse pod creation timestamp: %v", err)
-	}
-
-	restartCountString, ok := manifest.Annotations.Get(k8sRktRestartCountAnno)
-	if !ok {
-		return nil, nil, fmt.Errorf("pod is missing annotation: %s", k8sRktRestartCountAnno)
-	}
-	restartCount, err := strconv.Atoi(restartCountString)
-	if err != nil {
-		return nil, nil, fmt.Errorf("couldn't parse pod restart count: %v", err)
+		return nil, fmt.Errorf("couldn't parse pod creation timestamp: %v", err)
 	}
 
 	var containerHashes []uint64
@@ -871,15 +862,15 @@ func (r *Runtime) convertRktPod(rktpod rktapi.Pod) (*kubecontainer.Pod, *rktInfo
 		manifest := appcschema.ImageManifest{}
 		err := json.Unmarshal(app.Image.Manifest, manifest)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		containerHashString, ok := manifest.Annotations.Get(k8sRktContainerHashAnno)
 		if !ok {
-			return nil, nil, fmt.Errorf("app is missing annotation %s", k8sRktContainerHashAnno)
+			return nil, fmt.Errorf("app is missing annotation %s", k8sRktContainerHashAnno)
 		}
 		containerHash, err := strconv.ParseUint(containerHashString, 10, 64)
 		if err != nil {
-			return nil, nil, fmt.Errorf("couldn't parse container's hash: %v", err)
+			return nil, fmt.Errorf("couldn't parse container's hash: %v", err)
 		}
 		containerHashes = append(containerHashes, containerHash)
 	}
@@ -911,13 +902,7 @@ func (r *Runtime) convertRktPod(rktpod rktapi.Pod) (*kubecontainer.Pod, *rktInfo
 		})
 	}
 
-	info := &rktInfo{
-		uuid: string(podUID),
-		//TODO: figure out how to get the restartCount
-		restartCount: restartCount,
-	}
-
-	return kubepod, info, nil
+	return kubepod, nil
 }
 
 // readServiceFile reads the service file and constructs the runtime pod and the rkt info.
@@ -985,7 +970,7 @@ func (r *Runtime) GetPods(all bool) ([]*kubecontainer.Pod, error) {
 
 	var pods []*kubecontainer.Pod
 	for _, rktpod := range listResp.Pods {
-		pod, _, err := r.convertRktPod(*rktpod)
+		pod, err := r.convertRktPod(*rktpod)
 		if err != nil {
 			glog.Warningf("rkt: Cannot construct pod from unit file: %v.", err)
 			continue
