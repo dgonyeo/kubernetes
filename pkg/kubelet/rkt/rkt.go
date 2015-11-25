@@ -72,13 +72,15 @@ const (
 	unitRktID             = "RktID"
 	unitRestartCount      = "RestartCount"
 
-	kubernetesInfoAnnoName  = "k8s.io/pod/information"
-	k8sRktUIDAnno           = "k8s.io/rkt/uid"
-	k8sRktNameAnno          = "k8s.io/rkt/name"
-	k8sRktNamespaceAnno     = "k8s.io/rkt/namespace"
+	k8sRktKubeletAnno      = "k8s.io/rkt/managed-by-kubelet"
+	k8sRktKubeletAnnoValue = "true"
+	k8sRktUIDAnno          = "k8s.io/rkt/uid"
+	k8sRktNameAnno         = "k8s.io/rkt/name"
+	k8sRktNamespaceAnno    = "k8s.io/rkt/namespace"
+	//TODO: remove the creation time annotation once this is closed: https://github.com/coreos/rkt/issues/1789
 	k8sRktCreationTimeAnno  = "k8s.io/rkt/created"
-	k8sRktContainerHashAnno = "k8s/rkt/containerhash"
-	k8sRktRestartCountAnno  = "k8s/rkt/restartCount"
+	k8sRktContainerHashAnno = "k8s.io/rkt/containerhash"
+	k8sRktRestartCountAnno  = "k8s.io/rkt/restartCount"
 
 	dockerPrefix = "docker://"
 
@@ -437,10 +439,21 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 	listReq := &rktapi.ListPodsRequest{
 		Filter: &rktapi.PodFilter{
 			States: []rktapi.PodState{
+				//TODO: In the future some pods can remain running after some apps exit: https://github.com/appc/spec/pull/500
 				rktapi.PodState_POD_STATE_RUNNING,
 				rktapi.PodState_POD_STATE_EXITED,
 				rktapi.PodState_POD_STATE_DELETING,
 				rktapi.PodState_POD_STATE_GARBAGE,
+			},
+			Annotations: []*rktapi.KeyValue{
+				&rktapi.KeyValue{
+					Key:   k8sRktKubeletAnno,
+					Value: k8sRktKubeletAnnoValue,
+				},
+				&rktapi.KeyValue{
+					Key:   k8sRktUIDAnno,
+					Value: string(pod.UID),
+				},
 			},
 		},
 	}
@@ -456,15 +469,13 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 		if err != nil {
 			return nil, err
 		}
-		if uid, ok := manifest.Annotations.Get(k8sRktUIDAnno); ok && uid == string(pod.UID) {
-			if countString, ok := manifest.Annotations.Get(k8sRktRestartCountAnno); ok {
-				num, err := strconv.Atoi(countString)
-				if err != nil {
-					continue
-				}
-				if num+1 > restartCount {
-					restartCount = num + 1
-				}
+		if countString, ok := manifest.Annotations.Get(k8sRktRestartCountAnno); ok {
+			num, err := strconv.Atoi(countString)
+			if err != nil {
+				continue
+			}
+			if num+1 > restartCount {
+				restartCount = num + 1
 			}
 		}
 	}
@@ -479,6 +490,10 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 	//}
 
 	manifest.Annotations = append(manifest.Annotations, []appctypes.Annotation{
+		appctypes.Annotation{
+			Name:  k8sRktKubeletAnno,
+			Value: k8sRktKubeletAnnoValue,
+		},
 		appctypes.Annotation{
 			Name:  *appctypes.MustACIdentifier(k8sRktUIDAnno),
 			Value: string(pod.UID),
@@ -510,9 +525,6 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 			return nil, err
 		}
 
-		kubehash := kubecontainer.HashContainer(&c)
-		imgManifest.Annotations.Set(*appctypes.MustACIdentifier(k8sRktContainerHashAnno), strconv.FormatUint(kubehash, 10))
-
 		if imgManifest.App == nil {
 			imgManifest.App = new(appctypes.App)
 		}
@@ -543,10 +555,18 @@ func (r *Runtime) makePodManifest(pod *api.Pod, pullSecrets []api.Secret) (*appc
 		}
 		appName := appctypes.MustACName(name)
 
+		kubehash := kubecontainer.HashContainer(&c)
+
 		manifest.Apps = append(manifest.Apps, appcschema.RuntimeApp{
 			Name:  *appName,
 			Image: appcschema.RuntimeImage{ID: *hash},
 			App:   imgManifest.App,
+			Annotations: []appctypes.Annotation{
+				appctypes.Annotation{
+					Name:  *appctypes.MustACIdentifier(k8sRktContainerHashAnno),
+					Value: strconv.FormatUint(kubehash, 10),
+				},
+			},
 		})
 	}
 
