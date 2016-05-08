@@ -21,7 +21,17 @@ coreos:
     listen-peer-urls: http://${public_ip}:2380
     initial-cluster-state: new
     initial-cluster: ${etcd2_initial_cluster}
+  flannel:
+    interface: eth0
   units:
+    - name: flanneld.service
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Service]
+            Requires=etcd2.service
+            ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{ \"Network\": \"10.11.0.0/16\" }'
+      command: start
     - name: static.network
       command: start
       content: |

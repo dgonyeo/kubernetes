@@ -1,12 +1,48 @@
 #cloud-config
 
+write_files:
+    - path: "/etc/rkt/net.d/k8s_cluster.conf"
+      permissions: 0644
+      owner: "root"
+      content: |
+          { \"name\": \"rkt.kubernetes.io\", \"type\": \"flannel\" }
 coreos:
   units:
+#    - name: docker.socket
+#      mask: true
+    - name: rkt-install.service
+      command: start
+      content: |
+          [Unit]
+          Description=Installs rkt v1.5.1
+          Requires=network.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/bin/curl -L -o /root/rkt-v1.5.1.tar.gz https://github.com/coreos/rkt/releases/download/v1.5.1/rkt-v1.5.1.tar.gz
+          ExecStart=/usr/bin/tar xf /root/rkt-v1.5.1.tar.gz -C /opt
+          ExecStart=/usr/bin/curl -L -o /opt/stage1-coreos-1.5.1-linux-amd64.aci https://github.com/coreos/rkt/releases/download/v1.5.1/stage1-coreos-1.5.1-linux-amd64.aci
+          ExecStart=/usr/bin/curl -L -o /opt/stage1-coreos-1.5.1-linux-amd64.aci.asc https://github.com/coreos/rkt/releases/download/v1.5.1/stage1-coreos-1.5.1-linux-amd64.aci.asc
+    - name: rkt-api-service.service
+      command: start
+      content: |
+          [Unit]
+          Description=rkt api service
+          After=rkt-install.service
+
+          [Service]
+          ExecStart=/opt/rkt-v1.5.1/rkt api-service
+          Restart=always
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
     - name: kubelet.service
       command: start
       content: |
         [Unit]
-        After=opt-kubernetes.mount docker.socket
+        After=opt-kubernetes.mount rkt-api-service.service
         ConditionFileIsExecutable=/opt/kubernetes/bin/kubelet
         Description=Kubernetes Kubelet
         Documentation=https://github.com/kubernetes/kubernetes
@@ -22,7 +58,10 @@ coreos:
         --tls-private-key-file=/opt/kubernetes/certs/${NODE_NAMES[$i]}-node-key.pem \
         $( [[ "$ENABLE_CLUSTER_DNS" == "true" ]] && echo "--cluster-dns=${DNS_SERVER_IP}" ) \
         $( [[ "$ENABLE_CLUSTER_DNS" == "true" ]] && echo "--cluster-domain=${DNS_DOMAIN}" ) \
-        --config=/opt/kubernetes/manifests
+        --config=/opt/kubernetes/manifests \
+        --container-runtime=rkt \
+        --rkt-path=/opt/rkt-v1.5.1/rkt \
+        --rkt-stage1-image=/opt/stage1-coreos-1.5.1-linux-amd64.aci
         Restart=always
         RestartSec=2
 
